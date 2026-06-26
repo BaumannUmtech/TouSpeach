@@ -25,13 +25,15 @@ Usage:
 
 import argparse
 import logging
-from typing import Any, Dict
+import re
+from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 import numpy as np
 import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.audio import load_waveform
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
 
@@ -198,6 +200,11 @@ def build_demo(
         if mode == "clone":
             if not ref_audio:
                 return None, "Please upload a reference audio."
+            if not ref_text and getattr(model, "_asr_pipe", None) is None:
+                return (
+                    None,
+                    "Please enter the reference text. ASR is not loaded for this demo.",
+                )
             kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
                 ref_audio=ref_audio,
                 ref_text=ref_text,
@@ -491,6 +498,257 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                     ]
                     + vd_groups,
                     outputs=[vd_audio, vd_status],
+                )
+
+            # ==============================================================
+            # Dialogue
+            # ==============================================================
+            with gr.TabItem("Dialogue (2 Speakers)"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        dlg_text = gr.Textbox(
+                            label="Dialogue Text",
+                            lines=10,
+                            placeholder=(
+                                "Speaker 1: Hello, how are you?\n"
+                                "Speaker 2: I am fine, thanks.\n"
+                                "Speaker 1: Great to hear that."
+                            ),
+                        )
+                        dlg_lang = _lang_dropdown("Language (optional)")
+
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                dlg_s1_audio = gr.Audio(
+                                    label="Speaker 1 Reference Audio",
+                                    type="filepath",
+                                    elem_classes="compact-audio",
+                                )
+                                dlg_s1_text = gr.Textbox(
+                                    label="Speaker 1 Reference Text (optional)",
+                                    lines=2,
+                                    placeholder="Transcript of speaker 1 sample.",
+                                )
+                            with gr.Column(scale=1):
+                                dlg_s2_audio = gr.Audio(
+                                    label="Speaker 2 Reference Audio",
+                                    type="filepath",
+                                    elem_classes="compact-audio",
+                                )
+                                dlg_s2_text = gr.Textbox(
+                                    label="Speaker 2 Reference Text (optional)",
+                                    lines=2,
+                                    placeholder="Transcript of speaker 2 sample.",
+                                )
+
+                        with gr.Accordion("Generation Settings (optional)", open=False):
+                            dlg_sp = gr.Slider(
+                                0.5,
+                                1.5,
+                                value=1.0,
+                                step=0.05,
+                                label="Speed",
+                                info="1.0 = normal. >1 faster, <1 slower.",
+                            )
+                            dlg_pause = gr.Slider(
+                                0,
+                                1500,
+                                value=350,
+                                step=50,
+                                label="Pause Between Turns (ms)",
+                            )
+                            dlg_ns = gr.Slider(
+                                4,
+                                64,
+                                value=32,
+                                step=1,
+                                label="Inference Steps",
+                                info="Default: 32. Lower = faster, higher = better quality.",
+                            )
+                            dlg_dn = gr.Checkbox(
+                                label="Denoise",
+                                value=True,
+                                info="Default: enabled. Uncheck to disable denoising.",
+                            )
+                            dlg_gs = gr.Slider(
+                                0.0,
+                                4.0,
+                                value=2.0,
+                                step=0.1,
+                                label="Guidance Scale (CFG)",
+                                info="Default: 2.0.",
+                            )
+                            dlg_pp = gr.Checkbox(
+                                label="Preprocess Prompt",
+                                value=True,
+                                info="Apply silence removal and trimming to reference audio.",
+                            )
+                            dlg_po = gr.Checkbox(
+                                label="Postprocess Output",
+                                value=True,
+                                info="Remove long silences from generated audio.",
+                            )
+
+                        dlg_btn = gr.Button("Generate Dialogue", variant="primary")
+                    with gr.Column(scale=1):
+                        dlg_audio = gr.Audio(
+                            label="Output Dialogue Audio",
+                            type="numpy",
+                        )
+                        dlg_status = gr.Textbox(label="Status", lines=3)
+
+                def _parse_dialogue(text: str) -> List[Tuple[int, str]]:
+                    markers = list(
+                        re.finditer(r"\b(?:speaker|sprecher)\s*([12])\s*:", text, re.I)
+                    )
+                    if not markers:
+                        raise ValueError(
+                            "Use lines or inline markers like 'Speaker 1:' and 'Speaker 2:'."
+                        )
+
+                    turns = []
+                    for i, marker in enumerate(markers):
+                        start = marker.end()
+                        end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+                        turn_text = text[start:end].strip()
+                        if turn_text:
+                            turns.append((int(marker.group(1)), turn_text))
+
+                    if not turns:
+                        raise ValueError("No dialogue text found after the speaker labels.")
+                    return turns
+
+                def _merge_dialogue_audio(audios, pause_ms):
+                    if not audios:
+                        return None
+                    pause_len = int(sampling_rate * max(0, float(pause_ms or 0)) / 1000)
+                    pause = np.zeros(pause_len, dtype=np.float32)
+                    parts = []
+                    for i, audio in enumerate(audios):
+                        if i > 0 and pause_len > 0:
+                            parts.append(pause)
+                        parts.append(audio.astype(np.float32, copy=False))
+                    return np.concatenate(parts)
+
+                def _validate_reference_audio(audio_path, speaker_label):
+                    try:
+                        waveform, sr = load_waveform(audio_path)
+                    except Exception as e:
+                        raise ValueError(
+                            f"{speaker_label} reference audio could not be read: {e}"
+                        ) from e
+
+                    duration = waveform.shape[-1] / sr if sr else 0.0
+                    if duration < 0.5:
+                        raise ValueError(
+                            f"{speaker_label} reference audio is empty or too short "
+                            f"({duration:.2f}s). Please upload or record a clear sample."
+                        )
+
+                def _dialogue_fn(
+                    text,
+                    lang,
+                    s1_audio,
+                    s1_text,
+                    s2_audio,
+                    s2_text,
+                    speed,
+                    pause_ms,
+                    ns,
+                    dn,
+                    gs,
+                    pp,
+                    po,
+                ):
+                    if not text or not text.strip():
+                        return None, "Please enter dialogue text."
+                    if not s1_audio or not s2_audio:
+                        return None, "Please upload reference audio for both speakers."
+                    if (
+                        (
+                            not s1_text
+                            or not s1_text.strip()
+                            or not s2_text
+                            or not s2_text.strip()
+                        )
+                        and getattr(model, "_asr_pipe", None) is None
+                    ):
+                        return (
+                            None,
+                            "Please enter both reference texts. ASR is not loaded for this demo.",
+                        )
+
+                    try:
+                        turns = _parse_dialogue(text)
+                        _validate_reference_audio(s1_audio, "Speaker 1")
+                        _validate_reference_audio(s2_audio, "Speaker 2")
+                        gen_config = OmniVoiceGenerationConfig(
+                            num_step=int(ns or 32),
+                            guidance_scale=float(gs) if gs is not None else 2.0,
+                            denoise=bool(dn) if dn is not None else True,
+                            preprocess_prompt=bool(pp),
+                            postprocess_output=bool(po),
+                        )
+                        prompt_1 = model.create_voice_clone_prompt(
+                            ref_audio=s1_audio,
+                            ref_text=s1_text.strip() if s1_text else None,
+                            preprocess_prompt=bool(pp),
+                        )
+                        prompt_2 = model.create_voice_clone_prompt(
+                            ref_audio=s2_audio,
+                            ref_text=s2_text.strip() if s2_text else None,
+                            preprocess_prompt=bool(pp),
+                        )
+
+                        resolved_lang = lang if (lang and lang != "Auto") else None
+                        audios = []
+                        for turn_idx, (speaker_id, turn_text) in enumerate(turns, start=1):
+                            gen_kwargs: Dict[str, Any] = {
+                                "text": turn_text,
+                                "voice_clone_prompt": (
+                                    prompt_1 if speaker_id == 1 else prompt_2
+                                ),
+                                "language": resolved_lang,
+                                "generation_config": gen_config,
+                            }
+                            if speed is not None and float(speed) != 1.0:
+                                gen_kwargs["speed"] = float(speed)
+
+                            try:
+                                turn_audio = model.generate(**gen_kwargs)[0]
+                            except Exception as e:
+                                raise RuntimeError(
+                                    f"Turn {turn_idx} (Speaker {speaker_id}) failed: {e}"
+                                ) from e
+                            audios.append(turn_audio)
+
+                        merged = _merge_dialogue_audio(audios, pause_ms)
+                        if merged is None or merged.size == 0:
+                            raise RuntimeError("Dialogue generation returned empty audio.")
+                    except Exception as e:
+                        return None, f"Error: {type(e).__name__}: {e}"
+
+                    waveform = (merged * 32767).clip(-32768, 32767).astype(np.int16)
+                    return (sampling_rate, waveform), f"Done. Generated {len(turns)} turns."
+
+                dlg_btn.click(
+                    _dialogue_fn,
+                    inputs=[
+                        dlg_text,
+                        dlg_lang,
+                        dlg_s1_audio,
+                        dlg_s1_text,
+                        dlg_s2_audio,
+                        dlg_s2_text,
+                        dlg_sp,
+                        dlg_pause,
+                        dlg_ns,
+                        dlg_dn,
+                        dlg_gs,
+                        dlg_pp,
+                        dlg_po,
+                    ],
+                    outputs=[dlg_audio, dlg_status],
                 )
 
     return demo

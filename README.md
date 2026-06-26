@@ -132,6 +132,10 @@ Try OmniVoice without coding:
 
 For full usage, see the [Python API](#python-api) and [Command-Line Tools](#command-line-tools) sections below.
 
+For a Windows deployment with a local loopback API and a Django pull worker that
+writes M4A files directly to a media server, see
+[docs/windows-django-worker.md](docs/windows-django-worker.md).
+
 ---
 
 ## Python API
