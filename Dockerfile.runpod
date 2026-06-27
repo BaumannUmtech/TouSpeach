@@ -1,0 +1,42 @@
+ARG BASE_IMAGE=runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/workspace/.cache/huggingface \
+    TRANSFORMERS_CACHE=/workspace/.cache/huggingface \
+    OMNIVOICE_WORK_ROOT=/workspace/worker-data \
+    OMNIVOICE_TEMP_DIR=/tmp/omnivoice \
+    OMNIVOICE_MODEL=k2-fsa/OmniVoice \
+    OMNIVOICE_DEVICE=cuda \
+    OMNIVOICE_NUM_STEP=32 \
+    OMNIVOICE_GUIDANCE_SCALE=2.0
+
+WORKDIR /app
+
+RUN apt-get update -o Acquire::Retries=5 \
+    && apt-get install -y --no-install-recommends \
+        -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 \
+        ffmpeg \
+        libsndfile1 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md LICENSE ./
+COPY omnivoice ./omnivoice
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e .
+
+RUN mkdir -p "$OMNIVOICE_WORK_ROOT" "$OMNIVOICE_TEMP_DIR" "$HF_HOME"
+
+CMD omnivoice-runpod-worker \
+    --model "$OMNIVOICE_MODEL" \
+    --device "$OMNIVOICE_DEVICE" \
+    --work-root "$OMNIVOICE_WORK_ROOT" \
+    --temp-dir "$OMNIVOICE_TEMP_DIR" \
+    --num-step "$OMNIVOICE_NUM_STEP" \
+    --guidance-scale "$OMNIVOICE_GUIDANCE_SCALE"
